@@ -53,11 +53,7 @@ int fill_freq(double *samples, double freq, double duration, long int num_sample
 
   long int sampleno;
 
-  double t0;
-  
   for (sampleno = 0; sampleno < num_samples; sampleno++) {
-
-    t0 = (sampleno * duration) / num_samples;
 
     samples[sampleno] = cos(2.0 * M_PI * freq * duration * sampleno / num_samples);
 
@@ -69,6 +65,8 @@ int fill_freq(double *samples, double freq, double duration, long int num_sample
 
 typedef struct {
 
+  image_t *img_bg;
+  
   double complex weighted_sum;
 
   double dt;
@@ -95,59 +93,64 @@ void *fourier_work(void *extra) {
   
   long int sampleno;
 
-  double radians;
-  
   double radius;
-
-  double complex x;
 
   double complex fvalue;
   
-  double dt;
+  point_t pt;
+  
+  long int xpos, ypos;
+
+  long int offset;
+
+  double aspect;
+
+  image_t *img;
 
   double t0;
   
   fw = (fwork*) extra;
 
+  img = fw->img_bg;
+  
+  aspect = ((double) img->xres) / img->yres;
+  
   for (sampleno = fw->sampleno_start; sampleno < fw->sampleno_end; sampleno++) {
 
     t0 = (sampleno * fw->duration) / fw->num_samples;
     
-    radians = (2.0 * M_PI * fw->duration * sampleno) / fw->num_samples;
-
     radius = 0.5 + (0.5 * fw->samples_combined[sampleno]);
     
-    fvalue = radius * cexp(-2.0 * M_PI * I * t0 * fw->freq) * fw->dt;
+    fvalue = radius * cexp(-2.0 * M_PI * I * t0 * fw->freq);
 
-    fw->weighted_sum += fvalue;
+    fw->weighted_sum += (fvalue * fw->dt);
 
-    /*
+    {
+      
       pt.x = creal(fvalue);
       pt.y = cimag(fvalue);
 
-      pt.x *= sf;
-      pt.y *= sf;
-      
       pt.x /= aspect;
       pt.y *= -1.0;
     
-      xpos = pt.x * (img.xres >> 1); xpos += img.xres >> 1;
-      ypos = pt.y * (img.yres >> 1); ypos += img.yres >> 1;    
+      xpos = pt.x * (img->xres >> 1); xpos += img->xres >> 1;
+      ypos = pt.y * (img->yres >> 1); ypos += img->yres >> 1;    
 
-      if (xpos < 0 || xpos >= img.xres) {
-      continue;
+      if (xpos < 0 || xpos >= img->xres) {
+	continue;
       }
 
-      if (ypos < 0 || ypos >= img.yres) {
-      continue;
+      if (ypos < 0 || ypos >= img->yres) {
+	continue;
       }
 
-      offset = ypos * img.xres + xpos;
+      offset = ypos * img->xres + xpos;
       
-      img.rgb[offset].r += 500;
-      img.rgb[offset].g += 500;
-      img.rgb[offset].b += 500;      
-    */
+      img->rgb[offset].r += 2;
+      img->rgb[offset].g += 2;
+      img->rgb[offset].b += 2;      
+
+    }
       
   }
   
@@ -176,9 +179,13 @@ int plotpoint(image_t *img, char *desc, long int xpos, double y, pixel_t fill_co
 int main(int argc, char *argv[]) {
 
   long int input_xres, input_yres;
-  
-  image_t img;
 
+  image_t img;
+  
+  image_t img_bg;
+
+  image_t img_freqsweep;
+  
   long int num_pixels;
   size_t img_sz;
   
@@ -196,29 +203,15 @@ int main(int argc, char *argv[]) {
   
   long int num_samples;
 
-  long int count;
-
   long int sampleno;
-
-  double complex x;
-
-  double complex fvalue;
 
   double freq;
 
-  long int xpos, ypos;
+  long int xpos;
 
   point_t pt;
 
   pixel_t white;
-
-  pixel_t gray;
-  
-  double radians;
-
-  double radius;
-  
-  double aspect;
 
   double complex weighted_sum;
 
@@ -240,11 +233,7 @@ int main(int argc, char *argv[]) {
 
   double sf;
 
-  double complex dt;
-
   double v;
-
-  long int offset;
 
   int retval;
 
@@ -316,6 +305,19 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
+  img_bg = (image_t) { .rgb = malloc(img_sz), .xres = input_xres, .yres = input_yres };
+  if (img_bg.rgb == NULL) {
+    perror("malloc");
+    return -1;
+  }
+
+  img_freqsweep = (image_t) { .rgb = malloc(img_sz), .xres = input_xres, .yres = input_yres };
+  if (img_freqsweep.rgb == NULL) {
+    perror("malloc");
+    return -1;
+  }
+
+  
   num_threads = argc>2 ? strtol(argv[2],NULL,10) : def_numthreads;
 
   fprintf(stderr, "%s: Allocating %ld threads.\n", __FUNCTION__, num_threads);
@@ -334,13 +336,9 @@ int main(int argc, char *argv[]) {
   
   white = (pixel_t) { .r = 65535, .g = 65535, .b = 65535 };
 
-  gray = (pixel_t) { .r = 32768, .g = 32768, .b = 32768 };
-  
   red = (pixel_t) { .r = 65535, .g = 0, .b = 0 };
 
   green = (pixel_t) { .r = 0, .g = 65535, .b = 0 };
-  
-  aspect = ((double) img.xres) / img.yres;
   
   num_freqs = img.xres * 2;
 
@@ -357,22 +355,22 @@ int main(int argc, char *argv[]) {
     max_freq *= 2.0;
   }
   
-  dt = 1.0 / num_samples;
-
   for (freqno = 0; freqno < num_freqs; freqno++) {
 
     v = freqno; v /= num_freqs;
     
     freq = (1.0 - v) * min_freq + (v * max_freq);
     
-    percent = freqno; percent /= num_freqs;
+    percent = freqno; percent /= (num_freqs - 1);
     
     if (!(freqno%5)) {
-      fprintf(stderr, "%s: (freq %g) Percent complete %g     \r", __FUNCTION__, freq, percent * 100.0);
+      fprintf(stderr, "%s: (freq %g) Percent complete %.2g     \r", __FUNCTION__, freq, percent * 100.0);
     }
 
     for (threadno = 0; threadno < num_threads; threadno++) {
 
+      fws[threadno].img_bg = &img_bg;
+      
       fws[threadno].weighted_sum = 0.0;
 
       fws[threadno].dt = ((double) num_threads) / num_samples;
@@ -420,20 +418,33 @@ int main(int argc, char *argv[]) {
     pt.y = creal(weighted_sum);
     pt.y *= -1.0;
     pt.y *= sf;
-    plotpoint(&img, "Real", xpos, pt.y, red);
+    plotpoint(&img_freqsweep, "Real", xpos, pt.y, red);
 
     pt.y = cimag(weighted_sum);
     pt.y *= -1.0;
     pt.y *= sf;
-    plotpoint(&img, "Imag", xpos, pt.y, green);
+    plotpoint(&img_freqsweep, "Imag", xpos, pt.y, green);
 
     pt.y = cmag(weighted_sum);
     pt.y *= -1.0;
     pt.y *= sf;
-    plotpoint(&img, "Mag", xpos, pt.y, white);
+    plotpoint(&img_freqsweep, "Mag", xpos, pt.y, white);
     
   }
 
+  fprintf(stderr, "%s: Preparing final image.\n", __FUNCTION__);
+
+  memcpy(img.rgb, img_bg.rgb, img_sz);
+
+  {
+    long int pixelno;
+    for (pixelno = 0; pixelno < num_pixels; pixelno++) {
+      if (img_freqsweep.rgb[pixelno].r || img_freqsweep.rgb[pixelno].g || img_freqsweep.rgb[pixelno].b) {
+	img.rgb[pixelno] = img_freqsweep.rgb[pixelno];
+      }
+    }
+  }
+    
   fprintf(stderr, "%s: Writing image output to stdout.\n", __FUNCTION__);
   
   {
@@ -458,6 +469,10 @@ int main(int argc, char *argv[]) {
 
   free(samples_combined);
 
+  free(img_bg.rgb);
+
+  free(img_freqsweep.rgb);
+  
   free(img.rgb);
   
   return 0;
