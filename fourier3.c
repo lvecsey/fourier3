@@ -53,9 +53,13 @@ int fill_freq(double *samples, double freq, double duration, long int num_sample
 
   long int sampleno;
 
+  double vol;
+
+  vol = 0.9875;
+  
   for (sampleno = 0; sampleno < num_samples; sampleno++) {
 
-    samples[sampleno] = cos(2.0 * M_PI * freq * duration * sampleno / num_samples);
+    samples[sampleno] = vol * cos(2.0 * M_PI * freq * duration * sampleno / num_samples);
 
   }
     
@@ -69,8 +73,6 @@ typedef struct {
   
   double complex weighted_sum;
 
-  double dt;
-  
   double freq;
 
   double duration;
@@ -108,12 +110,16 @@ void *fourier_work(void *extra) {
   image_t *img;
 
   double t0;
+
+  double dt;
   
   fw = (fwork*) extra;
 
   img = fw->img_bg;
   
   aspect = ((double) img->xres) / img->yres;
+
+  dt = 1.0 / fw->num_samples;
   
   for (sampleno = fw->sampleno_start; sampleno < fw->sampleno_end; sampleno++) {
 
@@ -123,7 +129,7 @@ void *fourier_work(void *extra) {
     
     fvalue = radius * cexp(-2.0 * M_PI * I * t0 * fw->freq);
 
-    fw->weighted_sum += (fvalue * fw->dt);
+    fw->weighted_sum += (fvalue * dt);
 
     {
       
@@ -176,6 +182,14 @@ int plotpoint(image_t *img, char *desc, long int xpos, double y, pixel_t fill_co
   
 }
 
+typedef struct {
+
+  double min_freq;
+
+  double max_freq;
+  
+} zoom_param;
+
 int main(int argc, char *argv[]) {
 
   long int input_xres, input_yres;
@@ -221,10 +235,8 @@ int main(int argc, char *argv[]) {
 
   long int freqno;
 
-  double min_freq;
+  zoom_param vis_zoom;
   
-  double max_freq;
-
   pixel_t red;
 
   pixel_t green;
@@ -342,25 +354,35 @@ int main(int argc, char *argv[]) {
   
   num_freqs = img.xres * 2;
 
-  min_freq = 0.0;
-  max_freq = min_freq;
+  vis_zoom.min_freq = 0.0;
+  vis_zoom.max_freq = vis_zoom.min_freq;
 
   {
     long int ano;
+
     for (ano = 0; ano < sizeof(audio_freqs) / sizeof(long int); ano++) {
-      if (audio_freqs[ano] > max_freq) {
-	max_freq = audio_freqs[ano];
+      if (audio_freqs[ano] > vis_zoom.max_freq) {
+	vis_zoom.max_freq = audio_freqs[ano];
       }
     }
-    max_freq *= 2.0;
+    vis_zoom.max_freq *= 2.0;
+
+    vis_zoom.min_freq = vis_zoom.max_freq;
+    for (ano = 0; ano < sizeof(audio_freqs) / sizeof(long int); ano++) {
+      if (audio_freqs[ano] < vis_zoom.min_freq) {
+	vis_zoom.min_freq = audio_freqs[ano];
+      }
+    }
+
+    vis_zoom.min_freq *= 0.5;
   }
   
   for (freqno = 0; freqno < num_freqs; freqno++) {
 
     v = freqno; v /= num_freqs;
     
-    freq = (1.0 - v) * min_freq + (v * max_freq);
-    
+    freq = (1.0 - v) * vis_zoom.min_freq + (v * vis_zoom.max_freq);
+
     percent = freqno; percent /= (num_freqs - 1);
     
     if (!(freqno%5)) {
@@ -372,8 +394,6 @@ int main(int argc, char *argv[]) {
       fws[threadno].img_bg = &img_bg;
       
       fws[threadno].weighted_sum = 0.0;
-
-      fws[threadno].dt = ((double) num_threads) / num_samples;
 
       fws[threadno].freq = freq;
 
@@ -414,7 +434,7 @@ int main(int argc, char *argv[]) {
     xpos = (freqno * img.xres) / num_freqs;
 
     sf = duration;
-    
+
     pt.y = creal(weighted_sum);
     pt.y *= -1.0;
     pt.y *= sf;
