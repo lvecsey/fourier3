@@ -38,24 +38,13 @@
 
 #include "fill_sound.h"
 
+#include "cmag.h"
+
 #include "writefile.h"
 
 #define def_numthreads 4
 
-#define def_outsf "/tmp/outfile_fourier3-snd.raw"
-
-const long int FDEPTH = 4096;
-
-double cmag(double complex z) {
-
-  double x, y;
-
-  x = creal(z);
-  y = cimag(z);
-
-  return sqrt(x * x + y * y);
-  
-}
+const long int FDEPTH = 32768;
 
 int fill_freq(double *samples, double freq, double duration, long int num_samples) {
 
@@ -89,6 +78,10 @@ typedef struct {
 
   uint64_t state;
 
+  long int num_threads;
+  
+  long int threadno;
+  
   zoom_param *vis_zoom;
 
   double complex *weighted_sums;
@@ -110,8 +103,6 @@ typedef struct {
   long int sampleno_start;
 
   long int sampleno_end;  
-
-  long int num_threads;
   
   long int samplerate;
   
@@ -155,8 +146,8 @@ void *fourier_work(void *extra) {
 
     percent = fw->freqno; percent /= (fw->num_freqs - 1);
     
-    if (!(fw->freqno % (5 * fw->num_threads))) {
-      fprintf(stderr, "%s: (freq %g) Percent complete %.2g     \r", __FUNCTION__, freq, percent * 100.0);
+    if (!fw->threadno && !(fw->freqno % 10)) {
+      fprintf(stderr, "%s: (freq %g) Percent complete %.3g     \r", __FUNCTION__, freq, percent * 100.0);
     }
 
     weighted_sum = 0.0;
@@ -182,7 +173,11 @@ void *fourier_work(void *extra) {
     pthread_mutex_unlock(fw->wsum_mutex);
     
   }
-    
+
+  if (!fw->threadno) {
+    putchar('\n');
+  }
+  
   ret = NULL;
   
   return ret;
@@ -402,7 +397,7 @@ int main(int argc, char *argv[]) {
 
   green = (pixel_t) { .r = 0, .g = 65535, .b = 0 };
   
-  num_freqs = img_freqsweep.xres * 2;
+  num_freqs = img_freqsweep.xres * 8;
 
   vis_zoom.min_freq = argc>3 ? strtol(argv[3],NULL,10) : 0.0;
   vis_zoom.max_freq = argc>4 ? strtol(argv[4],NULL,10) : 0.0;
@@ -430,7 +425,11 @@ int main(int argc, char *argv[]) {
   for (threadno = 0; threadno < num_threads; threadno++) {
 
     fws[threadno].state = FRUNNING;
-      
+
+    fws[threadno].num_threads = num_threads;
+    
+    fws[threadno].threadno = threadno;
+    
     fws[threadno].weighted_sums = weighted_sums;
 
     fws[threadno].wsum_mutex = &wsum_mutex;
@@ -452,8 +451,6 @@ int main(int argc, char *argv[]) {
     fws[threadno].sampleno_start = threadno * num_samples / num_threads;
 
     fws[threadno].sampleno_end = (threadno+1) * num_samples / num_threads;
-
-    fws[threadno].num_threads = num_threads;
       
     fws[threadno].samplerate = samplerate;
       
@@ -530,6 +527,8 @@ int main(int argc, char *argv[]) {
     }
 
     fprintf(stderr, "[DEBUG] max_r1 %g max_i1 %g max_c1 %g\n", max_r1, max_i1, max_c1);
+
+    fprintf(stderr, "%s: Preparing final image.\n", __FUNCTION__);
     
     for (freqno = 0; freqno < num_freqs; freqno++) {
     
@@ -561,9 +560,7 @@ int main(int argc, char *argv[]) {
     free(i1);
     free(c1);
     
-  }
-  
-  fprintf(stderr, "%s: Preparing final image.\n", __FUNCTION__);
+  } 
 
   {
 
@@ -573,67 +570,71 @@ int main(int argc, char *argv[]) {
     
     env_OUTSF = getenv("OUTSF");
 
-    out_fn = env_OUTSF != NULL ? env_OUTSF : def_outsf;
+    out_fn = env_OUTSF;
+
+    if (out_fn != NULL) {
     
-    fprintf(stderr, "%s: Writing a reconstructed sound file.\n", __FUNCTION__);
-
-    {
-    
-      int out_fd;
-
-      mode_t mode;
-
-      size_t fsize;
-    
-      mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
-
-      out_fd = open(out_fn, O_RDWR | O_CREAT | O_TRUNC, mode);
-      if (out_fd == -1) {
-	perror("open");
-	return -1;
-      }
-    
-      fsize = num_samples * sizeof(double);
-
-      retval = ftruncate(out_fd, fsize);
-      if (retval == -1) {
-	perror("ftruncate");
-	return -1;
-      }
+      fprintf(stderr, "%s: Writing a reconstructed sound file.\n", __FUNCTION__);
 
       {
-	void *m;
-
-	m = mmap(NULL, fsize, PROT_READ|PROT_WRITE, MAP_SHARED, out_fd, 0);
-	if (m == MAP_FAILED) {
-	  perror("mmap");
-	  return -1;
-	}
-
-	retval = fill_sound(m, num_samples, samplerate, vis_zoom.min_freq, vis_zoom.max_freq, num_freqs, weighted_sums);
-	if (retval == -1) {
-	  fprintf(stderr, "%s: Trouble reconstructing sound.\n", __FUNCTION__);
-	  return -1;
-	}
-      
-	retval = munmap(m, fsize);
-	if (retval == -1) {
-	  perror("munmap");
-	  return -1;
-	}
-
-      }
     
-      retval = close(out_fd);
-      if (retval == -1) {
-	perror("close");
-	return -1;
-      }
+	int out_fd;
+
+	mode_t mode;
+
+	size_t fsize;
+    
+	mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+
+	out_fd = open(out_fn, O_RDWR | O_CREAT | O_TRUNC, mode);
+	if (out_fd == -1) {
+	  perror("open");
+	  return -1;
+	}
+    
+	fsize = num_samples * sizeof(double);
+
+	retval = ftruncate(out_fd, fsize);
+	if (retval == -1) {
+	  perror("ftruncate");
+	  return -1;
+	}
+
+	{
+	  void *m;
+
+	  m = mmap(NULL, fsize, PROT_READ|PROT_WRITE, MAP_SHARED, out_fd, 0);
+	  if (m == MAP_FAILED) {
+	    perror("mmap");
+	    return -1;
+	  }
+
+	  retval = fill_sound(m, num_samples, samplerate, vis_zoom.min_freq, vis_zoom.max_freq, num_freqs, weighted_sums);
+	  if (retval == -1) {
+	    fprintf(stderr, "%s: Trouble reconstructing sound.\n", __FUNCTION__);
+	    return -1;
+	  }
       
+	  retval = munmap(m, fsize);
+	  if (retval == -1) {
+	    perror("munmap");
+	    return -1;
+	  }
+
+	}
+    
+	retval = close(out_fd);
+	if (retval == -1) {
+	  perror("close");
+	  return -1;
+	}
+      
+      }
+
     }
 
   }
-  
+    
   fprintf(stderr, "%s: Writing image output to stdout.\n", __FUNCTION__);
   
   {

@@ -34,7 +34,16 @@ LIBS=-lm -lpthread
 /tmp/outfile_fourier3-snd.wav : /tmp/outfile_fourier3-snd.raw
 	ffmpeg -f f64le -i $^ -ar 48000 -ac 1 $@
 
-fourier3: fill_sound.o writefile.o fourier3.o
+/tmp/output_fourier3-wide.png : RENDER_RES=7680x2160
+
+/tmp/output_fourier3-wide.png : OUTPUT_RES=3840x1080
+
+/tmp/output_fourier3-wide.png : NUM_THREADS=4
+
+/tmp/output_fourier3-wide.png : fourier3
+	@OUT_FN=/tmp/output_fourier3-sndfile.raw ./$^ $(RENDER_RES) $(NUM_THREADS) 0.0 60.0 | convert -size $(RENDER_RES) rgb:- -resize $(OUTPUT_RES) -depth 32 $@
+
+fourier3: cmag.o fill_sound.o writefile.o fourier3.o
 	$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS) $(LIBS)
 
 .PHONY:
