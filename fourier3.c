@@ -77,12 +77,30 @@ int fill_freq(double *samples, double freq, double duration, long int num_sample
 
 typedef struct {
 
-  double complex weighted_sum;
+  double min_freq;
 
-  double freq;
+  double max_freq;
+  
+} zoom_param;
 
+enum { FNONE, FRUNNING, FWAITING, FDONE };
+
+typedef struct {
+
+  uint64_t state;
+
+  zoom_param *vis_zoom;
+
+  double complex *weighted_sums;
+
+  pthread_mutex_t *wsum_mutex;
+  
   double duration;
 
+  long int freqno;
+
+  long int num_freqs;
+  
   long int taken_count;
   
   double *samples_combined;
@@ -112,21 +130,57 @@ void *fourier_work(void *extra) {
   double t0;
 
   long int takenno;
+
+  double v;
+
+  double freq;
+
+  double complex weighted_sum;
+
+  double complex precompute;
+  
+  zoom_param *vis_zoom;
+
+  double percent;
   
   fw = (fwork*) extra;
 
-  for (takenno = 0; takenno < fw->taken_count; takenno++) {
+  vis_zoom = fw->vis_zoom;
+  
+  for ( ; fw->freqno < fw->num_freqs; fw->freqno++) {
 
-    sampleno = fw->sampleno_start;
+    v = fw->freqno; v /= fw->num_freqs;
     
-    sampleno += (takenno * (fw->sampleno_end - fw->sampleno_start)) / fw->taken_count;
+    freq = (1.0 - v) * vis_zoom->min_freq + (v * vis_zoom->max_freq);
+
+    percent = fw->freqno; percent /= (fw->num_freqs - 1);
+    
+    if (!(fw->freqno % (5 * fw->num_threads))) {
+      fprintf(stderr, "%s: (freq %g) Percent complete %.2g     \r", __FUNCTION__, freq, percent * 100.0);
+    }
+
+    weighted_sum = 0.0;
+
+    precompute = -2.0 * M_PI * I * freq;
+    
+    for (takenno = 0; takenno < fw->taken_count; takenno++) {
+
+      sampleno = fw->sampleno_start;
+    
+      sampleno += (takenno * (fw->sampleno_end - fw->sampleno_start)) / fw->taken_count;
       
-    t0 = (sampleno * fw->duration) / fw->num_samples;
+      t0 = (sampleno * fw->duration) / fw->num_samples;
     
-    fvalue = fw->samples_combined[sampleno] * cexp(-2.0 * M_PI * I * t0 * fw->freq);
+      fvalue = fw->samples_combined[sampleno] * cexp(precompute * t0);
 
-    fw->weighted_sum += fvalue;
+      weighted_sum += fvalue;
 
+    }
+
+    pthread_mutex_lock(fw->wsum_mutex);
+    fw->weighted_sums[fw->freqno] += weighted_sum;
+    pthread_mutex_unlock(fw->wsum_mutex);
+    
   }
     
   ret = NULL;
@@ -150,14 +204,6 @@ int plotpoint(image_t *img, char *desc, long int xpos, double y, pixel_t fill_co
   return 0;
   
 }
-
-typedef struct {
-
-  double min_freq;
-
-  double max_freq;
-  
-} zoom_param;
 
 enum { GEN_NONE, GEN_OWNAUDIO, GEN_PROVIDED };
 
@@ -186,8 +232,6 @@ int main(int argc, char *argv[]) {
 
   long int sampleno;
 
-  double freq;
-
   long int xpos;
 
   point_t pt;
@@ -208,11 +252,7 @@ int main(int argc, char *argv[]) {
 
   pixel_t green;
   
-  double percent;
-
   double sf;
-
-  double v;
 
   int retval;
 
@@ -222,6 +262,8 @@ int main(int argc, char *argv[]) {
 
   fwork *fws;
 
+  pthread_mutex_t wsum_mutex;
+  
   long int threadno;
 
   char *sndraw_fn;
@@ -373,66 +415,72 @@ int main(int argc, char *argv[]) {
   
   for (freqno = 0; freqno < num_freqs; freqno++) {
 
-    v = freqno; v /= num_freqs;
-    
-    freq = (1.0 - v) * vis_zoom.min_freq + (v * vis_zoom.max_freq);
-
-    percent = freqno; percent /= (num_freqs - 1);
-    
-    if (!(freqno%5)) {
-      fprintf(stderr, "%s: (freq %g) Percent complete %.2g     \r", __FUNCTION__, freq, percent * 100.0);
-    }
-
-    for (threadno = 0; threadno < num_threads; threadno++) {
-
-      fws[threadno].weighted_sum = 0.0;
-
-      fws[threadno].freq = freq;
-
-      fws[threadno].duration = duration;
-
-      fws[threadno].samples_combined = samples_combined;
-
-      fws[threadno].taken_count = FDEPTH;
-      
-      fws[threadno].num_samples = num_samples;
-
-      fws[threadno].sampleno_start = threadno * num_samples / num_threads;
-
-      fws[threadno].sampleno_end = (threadno+1) * num_samples / num_threads;
-
-      fws[threadno].num_threads = num_threads;
-      
-      fws[threadno].samplerate = samplerate;
-      
-      retval = pthread_create(threads + threadno, NULL, fourier_work, fws + threadno);
-      if (retval == -1) {
-	perror("pthread_create");
-	return -1;
-      }
-
-    }
-
-    for (threadno = 0; threadno < num_threads; threadno++) {
-
-      retval = pthread_join(threads[threadno], NULL);
-      if (retval == -1) {
-	perror("pthread_join");
-	return -1;
-      }
-      
-    }
-
     weighted_sums[freqno] = 0.0;
-    
-    for (threadno = 0; threadno < num_threads; threadno++) {
-      weighted_sums[freqno] += fws[threadno].weighted_sum;
-    }
-
-    weighted_sums[freqno] /= (FDEPTH * num_threads);
     
   }
 
+  fprintf(stderr, "%s: Performing fourier transform.\n", __FUNCTION__);
+
+  retval = pthread_mutex_init(&wsum_mutex, NULL);
+  if (retval != 0) {
+    fprintf(stderr, "%s: Trouble with call to pthread_mutex_init.\n", __FUNCTION__);
+    return -1;
+  }
+  
+  for (threadno = 0; threadno < num_threads; threadno++) {
+
+    fws[threadno].state = FRUNNING;
+      
+    fws[threadno].weighted_sums = weighted_sums;
+
+    fws[threadno].wsum_mutex = &wsum_mutex;
+    
+    fws[threadno].freqno = 0;
+
+    fws[threadno].num_freqs = num_freqs;
+      
+    fws[threadno].vis_zoom = &vis_zoom;
+      
+    fws[threadno].duration = duration;
+
+    fws[threadno].samples_combined = samples_combined;
+
+    fws[threadno].taken_count = FDEPTH;
+      
+    fws[threadno].num_samples = num_samples;
+
+    fws[threadno].sampleno_start = threadno * num_samples / num_threads;
+
+    fws[threadno].sampleno_end = (threadno+1) * num_samples / num_threads;
+
+    fws[threadno].num_threads = num_threads;
+      
+    fws[threadno].samplerate = samplerate;
+      
+    retval = pthread_create(threads + threadno, NULL, fourier_work, fws + threadno);
+    if (retval == -1) {
+      perror("pthread_create");
+      return -1;
+    }
+
+  }
+
+  for (threadno = 0; threadno < num_threads; threadno++) {
+
+    retval = pthread_join(threads[threadno], NULL);
+    if (retval == -1) {
+      perror("pthread_join");
+      return -1;
+    }
+      
+  }
+
+  for (freqno = 0; freqno < num_freqs; freqno++) {
+    weighted_sums[freqno] /= (FDEPTH * num_threads);
+  }
+  
+  fprintf(stderr, "%s: Generating plot of image data.\n", __FUNCTION__);
+  
   {
 
     double *r1, *i1, *c1;
@@ -538,8 +586,6 @@ int main(int argc, char *argv[]) {
       size_t fsize;
     
       mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
-
-
 
       out_fd = open(out_fn, O_RDWR | O_CREAT | O_TRUNC, mode);
       if (out_fd == -1) {
