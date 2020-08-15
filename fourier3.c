@@ -30,13 +30,21 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+#include <sys/mman.h>
+
 #include <pthread.h>
 
 #include "mini_gxkit.h"
 
+#include "fill_sound.h"
+
 #include "writefile.h"
 
 #define def_numthreads 4
+
+#define def_outsf "/tmp/outfile_fourier3-snd.raw"
+
+const long int FDEPTH = 4096;
 
 double cmag(double complex z) {
 
@@ -59,7 +67,7 @@ int fill_freq(double *samples, double freq, double duration, long int num_sample
   
   for (sampleno = 0; sampleno < num_samples; sampleno++) {
 
-    samples[sampleno] = vol * cos(2.0 * M_PI * freq * duration * sampleno / num_samples);
+    samples[sampleno] = vol * cos((2.0 * M_PI * freq * duration * sampleno) / num_samples);
 
   }
     
@@ -69,13 +77,13 @@ int fill_freq(double *samples, double freq, double duration, long int num_sample
 
 typedef struct {
 
-  image_t *img_bg;
-  
   double complex weighted_sum;
 
   double freq;
 
   double duration;
+
+  long int taken_count;
   
   double *samples_combined;
 
@@ -84,7 +92,11 @@ typedef struct {
   long int sampleno_start;
 
   long int sampleno_end;  
-    
+
+  long int num_threads;
+  
+  long int samplerate;
+  
 } fwork;
 
 void *fourier_work(void *extra) {
@@ -95,71 +107,28 @@ void *fourier_work(void *extra) {
   
   long int sampleno;
 
-  double radius;
-
   double complex fvalue;
   
-  point_t pt;
-  
-  long int xpos, ypos;
-
-  long int offset;
-
-  double aspect;
-
-  image_t *img;
-
   double t0;
 
-  double dt;
+  long int takenno;
   
   fw = (fwork*) extra;
 
-  img = fw->img_bg;
-  
-  aspect = ((double) img->xres) / img->yres;
+  for (takenno = 0; takenno < fw->taken_count; takenno++) {
 
-  dt = 1.0 / fw->num_samples;
-  
-  for (sampleno = fw->sampleno_start; sampleno < fw->sampleno_end; sampleno++) {
-
+    sampleno = fw->sampleno_start;
+    
+    sampleno += (takenno * (fw->sampleno_end - fw->sampleno_start)) / fw->taken_count;
+      
     t0 = (sampleno * fw->duration) / fw->num_samples;
     
-    radius = 0.5 + (0.5 * fw->samples_combined[sampleno]);
-    
-    fvalue = radius * cexp(-2.0 * M_PI * I * t0 * fw->freq);
+    fvalue = fw->samples_combined[sampleno] * cexp(-2.0 * M_PI * I * t0 * fw->freq);
 
-    fw->weighted_sum += (fvalue * dt);
+    fw->weighted_sum += fvalue;
 
-    {
-      
-      pt.x = creal(fvalue);
-      pt.y = cimag(fvalue);
-
-      pt.x /= aspect;
-      pt.y *= -1.0;
-    
-      xpos = pt.x * (img->xres >> 1); xpos += img->xres >> 1;
-      ypos = pt.y * (img->yres >> 1); ypos += img->yres >> 1;    
-
-      if (xpos < 0 || xpos >= img->xres) {
-	continue;
-      }
-
-      if (ypos < 0 || ypos >= img->yres) {
-	continue;
-      }
-
-      offset = ypos * img->xres + xpos;
-      
-      img->rgb[offset].r += 2;
-      img->rgb[offset].g += 2;
-      img->rgb[offset].b += 2;      
-
-    }
-      
   }
-  
+    
   ret = NULL;
   
   return ret;
@@ -190,13 +159,11 @@ typedef struct {
   
 } zoom_param;
 
+enum { GEN_NONE, GEN_OWNAUDIO, GEN_PROVIDED };
+
 int main(int argc, char *argv[]) {
 
   long int input_xres, input_yres;
-
-  image_t img;
-  
-  image_t img_bg;
 
   image_t img_freqsweep;
   
@@ -227,7 +194,7 @@ int main(int argc, char *argv[]) {
 
   pixel_t white;
 
-  double complex weighted_sum;
+  double complex *weighted_sums;
 
   double audio_freqs[3] = { 7.0, 17.0, 27.50 };
   
@@ -256,79 +223,120 @@ int main(int argc, char *argv[]) {
   fwork *fws;
 
   long int threadno;
+
+  char *sndraw_fn;
+
+  int fd;
+  struct stat buf;
+  void *m;
   
   duration = 10.0;
 
   samplerate = 48000;
 
-  num_samples = samplerate * duration;
+  sndraw_fn = argc>5 ? argv[5] : NULL;
 
-  fprintf(stderr, "%s: Allocating original audio tracks, and combined track.\n", __FUNCTION__);
+  samples_track1 = NULL;
+  samples_track2 = NULL;
+  samples_track3 = NULL;
   
-  samples_track1 = malloc(num_samples * sizeof(double));
-  if (samples_track1 == NULL) {
-    perror("malloc");
-    return -1;
+  if (sndraw_fn != NULL) {
+
+    fd = open(sndraw_fn, O_RDWR);
+    if (fd == -1) {
+      perror("open");
+      return -1;
+    }
+    
+    retval = fstat(fd, &buf);
+    if (retval == -1) {
+      perror("fstat");
+      return -1;
+    }
+    
+    m = mmap(NULL, buf.st_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) {
+      perror("mmap");
+      return -1;
+    }
+
+    samples_combined = (double*) m;
+
+    num_samples = buf.st_size / sizeof(double);
+
+    duration = ((double) num_samples) / samplerate;
+    
   }
 
-  samples_track2 = malloc(num_samples * sizeof(double));
-  if (samples_track2 == NULL) {
-    perror("malloc");
-    return -1;
-  }
+  else {
 
-  samples_track3 = malloc(num_samples * sizeof(double));
-  if (samples_track3 == NULL) {
-    perror("malloc");
-    return -1;
-  }
+    m = NULL;
 
-  samples_combined = malloc(num_samples * sizeof(double));
-  if (samples_combined == NULL) {
-    perror("malloc");
-    return -1;
-  }
-
-  fprintf(stderr, "%s: Placing signal into audio tracks + combining.\n", __FUNCTION__);
+    fd = -1;
+    
+    duration = 10.0;
+    
+    num_samples = samplerate * duration;
+    
+    fprintf(stderr, "%s: Allocating original audio tracks, and combined track.\n", __FUNCTION__);
   
-  fill_freq(samples_track1, audio_freqs[0], duration, num_samples);
-  fill_freq(samples_track2, audio_freqs[1], duration, num_samples);
-  fill_freq(samples_track3, audio_freqs[2], duration, num_samples);  
+    samples_track1 = malloc(num_samples * sizeof(double));
+    if (samples_track1 == NULL) {
+      perror("malloc");
+      return -1;
+    }
 
-  for (sampleno = 0; sampleno < num_samples; sampleno++) {
-    samples_combined[sampleno] = (samples_track1[sampleno] + samples_track2[sampleno] + samples_track3[sampleno]) / 3.0;
+    samples_track2 = malloc(num_samples * sizeof(double));
+    if (samples_track2 == NULL) {
+      perror("malloc");
+      return -1;
+    }
+
+    samples_track3 = malloc(num_samples * sizeof(double));
+    if (samples_track3 == NULL) {
+      perror("malloc");
+      return -1;
+    }
+
+    samples_combined = malloc(num_samples * sizeof(double));
+    if (samples_combined == NULL) {
+      perror("malloc");
+      return -1;
+    }
+
+    fprintf(stderr, "%s: Placing signal into audio tracks + combining.\n", __FUNCTION__);
+  
+    fill_freq(samples_track1, audio_freqs[0], duration, num_samples);
+    fill_freq(samples_track2, audio_freqs[1], duration, num_samples);
+    fill_freq(samples_track3, audio_freqs[2], duration, num_samples);  
+
+    for (sampleno = 0; sampleno < num_samples; sampleno++) {
+      samples_combined[sampleno] = (samples_track1[sampleno] + samples_track2[sampleno] + samples_track3[sampleno]) / 3.0;
+    }
+
   }
 
+  fprintf(stderr, "%s: Using num_samples %ld\n", __FUNCTION__, num_samples);
+  
   retval = argc>1 ? sscanf(argv[1],"%ldx%ld",&input_xres,&input_yres) : -1;
   if (retval != 2) {
     fprintf(stderr, "%s: Please specify render resolution.\n", __FUNCTION__);
     return -1;
   }
   
-  img.xres = input_xres;
-  img.yres = input_yres;
+  img_freqsweep.xres = input_xres;
+  img_freqsweep.yres = input_yres;
 
-  num_pixels = img.xres * img.yres;
+  num_pixels = img_freqsweep.xres * img_freqsweep.yres;
   img_sz = num_pixels * sizeof(pixel_t);
   
-  img.rgb = malloc(img_sz);
-  if (img.rgb == NULL) {
-    perror("malloc");
-    return -1;
-  }
-
-  img_bg = (image_t) { .rgb = malloc(img_sz), .xres = input_xres, .yres = input_yres };
-  if (img_bg.rgb == NULL) {
-    perror("malloc");
-    return -1;
-  }
-
-  img_freqsweep = (image_t) { .rgb = malloc(img_sz), .xres = input_xres, .yres = input_yres };
+  img_freqsweep.rgb = malloc(img_sz);
   if (img_freqsweep.rgb == NULL) {
     perror("malloc");
     return -1;
   }
 
+  memset(img_freqsweep.rgb, 0, img_sz);
   
   num_threads = argc>2 ? strtol(argv[2],NULL,10) : def_numthreads;
 
@@ -352,29 +360,15 @@ int main(int argc, char *argv[]) {
 
   green = (pixel_t) { .r = 0, .g = 65535, .b = 0 };
   
-  num_freqs = img.xres * 2;
+  num_freqs = img_freqsweep.xres * 2;
 
-  vis_zoom.min_freq = 0.0;
-  vis_zoom.max_freq = vis_zoom.min_freq;
+  vis_zoom.min_freq = argc>3 ? strtol(argv[3],NULL,10) : 0.0;
+  vis_zoom.max_freq = argc>4 ? strtol(argv[4],NULL,10) : 0.0;
 
-  {
-    long int ano;
-
-    for (ano = 0; ano < sizeof(audio_freqs) / sizeof(long int); ano++) {
-      if (audio_freqs[ano] > vis_zoom.max_freq) {
-	vis_zoom.max_freq = audio_freqs[ano];
-      }
-    }
-    vis_zoom.max_freq *= 2.0;
-
-    vis_zoom.min_freq = vis_zoom.max_freq;
-    for (ano = 0; ano < sizeof(audio_freqs) / sizeof(long int); ano++) {
-      if (audio_freqs[ano] < vis_zoom.min_freq) {
-	vis_zoom.min_freq = audio_freqs[ano];
-      }
-    }
-
-    vis_zoom.min_freq *= 0.5;
+  weighted_sums = malloc(num_freqs * sizeof(double complex));
+  if (weighted_sums == NULL) {
+    perror("malloc");
+    return -1;
   }
   
   for (freqno = 0; freqno < num_freqs; freqno++) {
@@ -391,21 +385,25 @@ int main(int argc, char *argv[]) {
 
     for (threadno = 0; threadno < num_threads; threadno++) {
 
-      fws[threadno].img_bg = &img_bg;
-      
       fws[threadno].weighted_sum = 0.0;
 
       fws[threadno].freq = freq;
 
       fws[threadno].duration = duration;
-      
+
       fws[threadno].samples_combined = samples_combined;
 
+      fws[threadno].taken_count = FDEPTH;
+      
       fws[threadno].num_samples = num_samples;
 
       fws[threadno].sampleno_start = threadno * num_samples / num_threads;
 
       fws[threadno].sampleno_end = (threadno+1) * num_samples / num_threads;
+
+      fws[threadno].num_threads = num_threads;
+      
+      fws[threadno].samplerate = samplerate;
       
       retval = pthread_create(threads + threadno, NULL, fourier_work, fws + threadno);
       if (retval == -1) {
@@ -425,46 +423,171 @@ int main(int argc, char *argv[]) {
       
     }
 
-    weighted_sum = 0.0;
+    weighted_sums[freqno] = 0.0;
     
     for (threadno = 0; threadno < num_threads; threadno++) {
-      weighted_sum += fws[threadno].weighted_sum;
+      weighted_sums[freqno] += fws[threadno].weighted_sum;
     }
-      
-    xpos = (freqno * img.xres) / num_freqs;
 
-    sf = duration;
-
-    pt.y = creal(weighted_sum);
-    pt.y *= -1.0;
-    pt.y *= sf;
-    plotpoint(&img_freqsweep, "Real", xpos, pt.y, red);
-
-    pt.y = cimag(weighted_sum);
-    pt.y *= -1.0;
-    pt.y *= sf;
-    plotpoint(&img_freqsweep, "Imag", xpos, pt.y, green);
-
-    pt.y = cmag(weighted_sum);
-    pt.y *= -1.0;
-    pt.y *= sf;
-    plotpoint(&img_freqsweep, "Mag", xpos, pt.y, white);
+    weighted_sums[freqno] /= (FDEPTH * num_threads);
     
   }
-
-  fprintf(stderr, "%s: Preparing final image.\n", __FUNCTION__);
-
-  memcpy(img.rgb, img_bg.rgb, img_sz);
 
   {
-    long int pixelno;
-    for (pixelno = 0; pixelno < num_pixels; pixelno++) {
-      if (img_freqsweep.rgb[pixelno].r || img_freqsweep.rgb[pixelno].g || img_freqsweep.rgb[pixelno].b) {
-	img.rgb[pixelno] = img_freqsweep.rgb[pixelno];
-      }
-    }
-  }
+
+    double *r1, *i1, *c1;
+
+    double max_r1, max_i1, max_c1;
     
+    r1 = malloc(num_freqs * sizeof(double));
+    if (r1 == NULL) {
+      perror("malloc");
+      return -1;
+    }
+
+    i1 = malloc(num_freqs * sizeof(double));
+    if (i1 == NULL) {
+      perror("malloc");
+      return -1;
+    }
+
+    c1 = malloc(num_freqs * sizeof(double));
+    if (c1 == NULL) {
+      perror("malloc");
+      return -1;
+    }
+
+    max_r1 = 0.0;
+    max_i1 = 0.0;
+    max_c1 = 0.0;
+    
+    for (freqno = 0; freqno < num_freqs; freqno++) {
+
+      r1[freqno] = creal(weighted_sums[freqno]);
+      i1[freqno] = cimag(weighted_sums[freqno]);
+      c1[freqno] = cmag(weighted_sums[freqno]);
+
+      if (r1[freqno] > max_r1) {
+	max_r1 = r1[freqno];
+      }
+
+      if (i1[freqno] > max_i1) {
+	max_i1 = i1[freqno];
+      }
+
+      if (c1[freqno] > max_c1) {
+	max_c1 = c1[freqno];
+      }      
+      
+    }
+
+    fprintf(stderr, "[DEBUG] max_r1 %g max_i1 %g max_c1 %g\n", max_r1, max_i1, max_c1);
+    
+    for (freqno = 0; freqno < num_freqs; freqno++) {
+    
+      xpos = (freqno * img_freqsweep.xres) / num_freqs;
+
+      sf = 10.0;
+      
+      pt.y = r1[freqno];
+      pt.y *= -1.0;
+      pt.y /= max_r1;
+      pt.y *= sf;
+      plotpoint(&img_freqsweep, "Real", xpos, pt.y, red);
+
+      pt.y = i1[freqno];
+      pt.y *= -1.0;
+      pt.y /= max_i1;
+      pt.y *= sf;
+      plotpoint(&img_freqsweep, "Imag", xpos, pt.y, green);
+    
+      pt.y = c1[freqno];
+      pt.y *= -1.0;
+      pt.y /= max_c1;
+      pt.y *= sf;
+      plotpoint(&img_freqsweep, "Mag", xpos, pt.y, white);
+
+    }
+    
+    free(r1);
+    free(i1);
+    free(c1);
+    
+  }
+  
+  fprintf(stderr, "%s: Preparing final image.\n", __FUNCTION__);
+
+  {
+
+    char *env_OUTSF;
+
+    char *out_fn;
+    
+    env_OUTSF = getenv("OUTSF");
+
+    out_fn = env_OUTSF != NULL ? env_OUTSF : def_outsf;
+    
+    fprintf(stderr, "%s: Writing a reconstructed sound file.\n", __FUNCTION__);
+
+    {
+    
+      int out_fd;
+
+      mode_t mode;
+
+      size_t fsize;
+    
+      mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+
+
+
+      out_fd = open(out_fn, O_RDWR | O_CREAT | O_TRUNC, mode);
+      if (out_fd == -1) {
+	perror("open");
+	return -1;
+      }
+    
+      fsize = num_samples * sizeof(double);
+
+      retval = ftruncate(out_fd, fsize);
+      if (retval == -1) {
+	perror("ftruncate");
+	return -1;
+      }
+
+      {
+	void *m;
+
+	m = mmap(NULL, fsize, PROT_READ|PROT_WRITE, MAP_SHARED, out_fd, 0);
+	if (m == MAP_FAILED) {
+	  perror("mmap");
+	  return -1;
+	}
+
+	retval = fill_sound(m, num_samples, samplerate, vis_zoom.min_freq, vis_zoom.max_freq, num_freqs, weighted_sums);
+	if (retval == -1) {
+	  fprintf(stderr, "%s: Trouble reconstructing sound.\n", __FUNCTION__);
+	  return -1;
+	}
+      
+	retval = munmap(m, fsize);
+	if (retval == -1) {
+	  perror("munmap");
+	  return -1;
+	}
+
+      }
+    
+      retval = close(out_fd);
+      if (retval == -1) {
+	perror("close");
+	return -1;
+      }
+      
+    }
+
+  }
+  
   fprintf(stderr, "%s: Writing image output to stdout.\n", __FUNCTION__);
   
   {
@@ -472,28 +595,46 @@ int main(int argc, char *argv[]) {
     ssize_t bytes_written;
 
     out_fd = 1;
-    bytes_written = writefile(out_fd, img.rgb, img_sz);
+    bytes_written = writefile(out_fd, img_freqsweep.rgb, img_sz);
     if (bytes_written != img_sz) {
       perror("write");
       return -1;
     }
   }
 
+  if (sndraw_fn != NULL && fd != -1 && m != NULL) {
+
+    retval = munmap(m, buf.st_size);
+    if (retval == -1) {
+      perror("munmap");
+      return -1;
+    }
+
+    retval = close(fd);
+    if (retval == -1) {
+      perror("close");
+      return -1;
+    }
+    
+  }
+
+  else if (m == NULL) {
+
+    free(samples_track1);
+    free(samples_track2);
+    free(samples_track3);  
+
+    free(samples_combined);
+    
+  }
+
   free(fws);
   
   free(threads);
 
-  free(samples_track1);
-  free(samples_track2);
-  free(samples_track3);  
-
-  free(samples_combined);
-
-  free(img_bg.rgb);
-
-  free(img_freqsweep.rgb);
+  free(weighted_sums);
   
-  free(img.rgb);
+  free(img_freqsweep.rgb);
   
   return 0;
 
