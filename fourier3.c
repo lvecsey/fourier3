@@ -44,7 +44,12 @@
 
 #define def_numthreads 4
 
-const long int FDEPTH = 32768;
+const long int FDEPTH = 1024;
+
+#define freqinf_neg -25000.0
+#define freqinf_pos 25000.0
+
+#define def_duration 2.50
 
 int fill_freq(double *samples, double freq, double duration, long int num_samples) {
 
@@ -70,7 +75,7 @@ typedef struct {
 
   double max_freq;
   
-} zoom_param;
+} freqrange;
 
 enum { FNONE, FRUNNING, FWAITING, FDONE };
 
@@ -81,8 +86,8 @@ typedef struct {
   long int num_threads;
   
   long int threadno;
-  
-  zoom_param *vis_zoom;
+
+  freqrange *base_freqrange;
 
   double complex *weighted_sums;
 
@@ -105,8 +110,105 @@ typedef struct {
   long int sampleno_end;  
   
   long int samplerate;
+
+  double complex (*integrate_func)(double complex precompute, void *extra);
   
 } fwork;
+
+double complex taken_buildweightedsum(double complex precompute, void *extra) {
+
+  double complex weighted_sum;
+
+  double complex weighted_sum1, weighted_sum2;  
+
+  double complex vertbar;
+  
+  long int takenno;
+
+  long int sampleno1, sampleno2;
+
+  double t0, t1;
+
+  double dx;
+  
+  fwork *fw;
+  
+  weighted_sum = 0.0;
+
+  fw = (fwork*) extra;
+
+  takenno = 0;
+  sampleno1 = fw->sampleno_start;
+  sampleno1 += (takenno * (fw->sampleno_end - fw->sampleno_start)) / fw->taken_count;
+  t0 = (sampleno1 * fw->duration) / fw->num_samples;
+  weighted_sum1 = fw->samples_combined[sampleno1] * cexp(precompute * t0);
+  
+  for (takenno = 1; takenno < fw->taken_count; takenno++) {
+
+    sampleno2 = fw->sampleno_start;
+    sampleno2 += (takenno * (fw->sampleno_end - fw->sampleno_start)) / fw->taken_count;
+    t1 = (sampleno2 * fw->duration) / fw->num_samples;
+    weighted_sum2 = fw->samples_combined[sampleno2] * cexp(precompute * t1);
+
+    vertbar = 0.5 * (weighted_sum1 + weighted_sum2);
+
+    dx = (t1 - t0);
+    
+    weighted_sum += (vertbar * dx);
+
+    t0 = t1;
+    sampleno1 = sampleno2;
+    weighted_sum1 = weighted_sum2;
+
+  }
+
+  return weighted_sum;
+
+}  
+
+double complex full_buildweightedsum(double complex precompute, void *extra) {
+
+  long int sampleno;
+
+  double t0, t1;
+
+  double complex weighted_sum;
+  
+  double complex weighted_sum1, weighted_sum2;
+
+  fwork *fw;
+
+  double complex vertbar;
+
+  double dx;
+  
+  weighted_sum = 0.0;
+
+  fw = (fwork*) extra;
+
+  sampleno = fw->sampleno_start;
+  t0 = ((sampleno-1) * fw->duration) / fw->num_samples;
+  weighted_sum1 = fw->samples_combined[sampleno] * cexp(precompute * t0);
+  
+  for (sampleno = fw->sampleno_start + 1; sampleno < fw->sampleno_end; sampleno++) {
+
+    t1 = (sampleno * fw->duration) / fw->num_samples;    
+    weighted_sum2 = fw->samples_combined[sampleno] * cexp(precompute * t1);    
+
+    vertbar = 0.5 * (weighted_sum1 + weighted_sum2);
+
+    dx = (t1 - t0);
+    
+    weighted_sum += (vertbar * dx);
+
+    t0 = t1;
+    weighted_sum1 = weighted_sum2;
+    
+  }
+
+  return weighted_sum;
+
+}
 
 void *fourier_work(void *extra) {
 
@@ -114,14 +216,6 @@ void *fourier_work(void *extra) {
 
   fwork *fw;
   
-  long int sampleno;
-
-  double complex fvalue;
-  
-  double t0;
-
-  long int takenno;
-
   double v;
 
   double freq;
@@ -130,44 +224,30 @@ void *fourier_work(void *extra) {
 
   double complex precompute;
   
-  zoom_param *vis_zoom;
+  freqrange *base_freqrange;
 
   double percent;
-  
+
   fw = (fwork*) extra;
 
-  vis_zoom = fw->vis_zoom;
-  
+  base_freqrange = fw->base_freqrange;
+
   for ( ; fw->freqno < fw->num_freqs; fw->freqno++) {
 
     v = fw->freqno; v /= fw->num_freqs;
     
-    freq = (1.0 - v) * vis_zoom->min_freq + (v * vis_zoom->max_freq);
+    freq = (1.0 - v) * base_freqrange->min_freq + (v * base_freqrange->max_freq);
 
     percent = fw->freqno; percent /= (fw->num_freqs - 1);
     
     if (!fw->threadno && !(fw->freqno % 10)) {
-      fprintf(stderr, "%s: (freq %g) Percent complete %.3g     \r", __FUNCTION__, freq, percent * 100.0);
+      fprintf(stderr, "%s: (freq %.6g) Percent complete %.3g     \r", __FUNCTION__, freq, percent * 100.0);
     }
 
-    weighted_sum = 0.0;
-
-    precompute = -2.0 * M_PI * I * freq;
+    precompute = (-2.0 * M_PI * I * freq);
     
-    for (takenno = 0; takenno < fw->taken_count; takenno++) {
-
-      sampleno = fw->sampleno_start;
+    weighted_sum = fw->integrate_func(precompute, fw);
     
-      sampleno += (takenno * (fw->sampleno_end - fw->sampleno_start)) / fw->taken_count;
-      
-      t0 = (sampleno * fw->duration) / fw->num_samples;
-    
-      fvalue = fw->samples_combined[sampleno] * cexp(precompute * t0);
-
-      weighted_sum += fvalue;
-
-    }
-
     pthread_mutex_lock(fw->wsum_mutex);
     fw->weighted_sums[fw->freqno] += weighted_sum;
     pthread_mutex_unlock(fw->wsum_mutex);
@@ -241,7 +321,7 @@ int main(int argc, char *argv[]) {
 
   long int freqno;
 
-  zoom_param vis_zoom;
+  freqrange base_freqrange, vis_zoom;
   
   pixel_t red;
 
@@ -267,8 +347,6 @@ int main(int argc, char *argv[]) {
   struct stat buf;
   void *m;
   
-  duration = 10.0;
-
   samplerate = 48000;
 
   sndraw_fn = argc>5 ? argv[5] : NULL;
@@ -311,7 +389,7 @@ int main(int argc, char *argv[]) {
 
     fd = -1;
     
-    duration = 10.0;
+    duration = def_duration;
     
     num_samples = samplerate * duration;
     
@@ -397,11 +475,19 @@ int main(int argc, char *argv[]) {
 
   green = (pixel_t) { .r = 0, .g = 65535, .b = 0 };
   
-  num_freqs = img_freqsweep.xres * 8;
+  num_freqs = img_freqsweep.xres * 128;
 
   vis_zoom.min_freq = argc>3 ? strtol(argv[3],NULL,10) : 0.0;
-  vis_zoom.max_freq = argc>4 ? strtol(argv[4],NULL,10) : 0.0;
+  vis_zoom.max_freq = argc>4 ? strtol(argv[4],NULL,10) : 1000.0;
 
+  /*
+  base_freqrange.min_freq = freqinf_neg;
+  base_freqrange.max_freq = freqinf_pos;
+  */
+
+  base_freqrange.min_freq = -vis_zoom.max_freq;
+  base_freqrange.max_freq = vis_zoom.max_freq;
+  
   weighted_sums = malloc(num_freqs * sizeof(double complex));
   if (weighted_sums == NULL) {
     perror("malloc");
@@ -437,9 +523,9 @@ int main(int argc, char *argv[]) {
     fws[threadno].freqno = 0;
 
     fws[threadno].num_freqs = num_freqs;
-      
-    fws[threadno].vis_zoom = &vis_zoom;
-      
+
+    fws[threadno].base_freqrange = &base_freqrange;
+    
     fws[threadno].duration = duration;
 
     fws[threadno].samples_combined = samples_combined;
@@ -448,12 +534,14 @@ int main(int argc, char *argv[]) {
       
     fws[threadno].num_samples = num_samples;
 
-    fws[threadno].sampleno_start = threadno * num_samples / num_threads;
+    fws[threadno].sampleno_start = (threadno * num_samples) / num_threads;
 
-    fws[threadno].sampleno_end = (threadno+1) * num_samples / num_threads;
+    fws[threadno].sampleno_end = ((threadno+1) * num_samples) / num_threads;
       
     fws[threadno].samplerate = samplerate;
-      
+
+    fws[threadno].integrate_func = taken_buildweightedsum;
+    
     retval = pthread_create(threads + threadno, NULL, fourier_work, fws + threadno);
     if (retval == -1) {
       perror("pthread_create");
@@ -472,10 +560,6 @@ int main(int argc, char *argv[]) {
       
   }
 
-  for (freqno = 0; freqno < num_freqs; freqno++) {
-    weighted_sums[freqno] /= (FDEPTH * num_threads);
-  }
-  
   fprintf(stderr, "%s: Generating plot of image data.\n", __FUNCTION__);
   
   {
@@ -529,33 +613,43 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "[DEBUG] max_r1 %g max_i1 %g max_c1 %g\n", max_r1, max_i1, max_c1);
 
     fprintf(stderr, "%s: Preparing final image.\n", __FUNCTION__);
-    
-    for (freqno = 0; freqno < num_freqs; freqno++) {
-    
-      xpos = (freqno * img_freqsweep.xres) / num_freqs;
 
-      sf = 10.0;
+    {
+
+      long int start_freqno, end_freqno;
+
+      start_freqno = (num_freqs >> 1) + (num_freqs >> 1) * vis_zoom.min_freq / base_freqrange.max_freq;
+
+      end_freqno = start_freqno + (num_freqs >> 1) * vis_zoom.max_freq / base_freqrange.max_freq;
       
-      pt.y = r1[freqno];
-      pt.y *= -1.0;
-      pt.y /= max_r1;
-      pt.y *= sf;
-      plotpoint(&img_freqsweep, "Real", xpos, pt.y, red);
+      for (freqno = start_freqno; freqno < end_freqno; freqno++) {
 
-      pt.y = i1[freqno];
-      pt.y *= -1.0;
-      pt.y /= max_i1;
-      pt.y *= sf;
-      plotpoint(&img_freqsweep, "Imag", xpos, pt.y, green);
+	xpos = ((freqno - start_freqno) * img_freqsweep.xres) / (end_freqno - start_freqno);
+	
+	sf = 5.0;
+      
+	pt.y = r1[freqno];
+	pt.y *= -1.0;
+	pt.y /= max_r1;
+	pt.y *= sf;
+	plotpoint(&img_freqsweep, "Real", xpos, pt.y, red);
+
+	pt.y = i1[freqno];
+	pt.y *= -1.0;
+	pt.y /= max_i1;
+	pt.y *= sf;
+	plotpoint(&img_freqsweep, "Imag", xpos, pt.y, green);
     
-      pt.y = c1[freqno];
-      pt.y *= -1.0;
-      pt.y /= max_c1;
-      pt.y *= sf;
-      plotpoint(&img_freqsweep, "Mag", xpos, pt.y, white);
+	pt.y = c1[freqno];
+	pt.y *= -1.0;
+	pt.y /= max_c1;
+	pt.y *= sf;
+	plotpoint(&img_freqsweep, "Mag", xpos, pt.y, white);
+
+      }
 
     }
-    
+      
     free(r1);
     free(i1);
     free(c1);

@@ -1,7 +1,9 @@
 
 CC=gcc
 
-CFLAGS=-O3 -Wall -g -pg -fsanitize=address,undefined -fno-omit-frame-pointer
+MEMCHECK=-fsanitize=address,undefined -fno-omit-frame-pointer
+
+CFLAGS=-O3 -Wall -g -pg # $(MEMCHECK) 
 
 LIBS=-lm -lpthread
 
@@ -41,7 +43,7 @@ LIBS=-lm -lpthread
 /tmp/output_fourier3-wide.png : NUM_THREADS=4
 
 /tmp/output_fourier3-wide.png : fourier3
-	@OUT_FN=/tmp/output_fourier3-sndfile.raw ./$^ $(RENDER_RES) $(NUM_THREADS) 0.0 60.0 | convert -size $(RENDER_RES) rgb:- -resize $(OUTPUT_RES) -depth 32 $@
+	@OUTSF=/tmp/output_fourier3-sndfile.raw ./$^ $(RENDER_RES) $(NUM_THREADS) 0.0 60.0 | convert -size $(RENDER_RES) rgb:- -resize $(OUTPUT_RES) -depth 32 $@
 
 fourier3: cmag.o fill_sound.o writefile.o fourier3.o
 	$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS) $(LIBS)
